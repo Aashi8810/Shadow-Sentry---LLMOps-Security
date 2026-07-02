@@ -1,101 +1,86 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+import json
 
-from app.models.schemas import ChatRequest, ChatResponseAllowed
+from app.models.schemas import ChatRequest, DocumentChatRequest, ChatResponse
 from app.db.database import get_db
 from app.db.models import AuditLog
 from app.llm.client import generate, LLMClientError
 from app.config import settings
 
-# --- New Imports for Day 2 ---
 from app.detection.regex_filter import scan_prompt_regex
 from app.detection.llama_guard import check_prompt_safety
+from app.detection.pii_detector import scan_and_redact_pii
+from app.scoring.risk_engine import evaluate_risk
 
 router = APIRouter(prefix="/v1", tags=["chat"])
 
-@router.post("/chat", response_model=ChatResponseAllowed)
+@router.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest, db: Session = Depends(get_db)):
     reasons = []
-    risk_score = 0
-    
-    # --- PRE-FLIGHT CHECKS ---
-    
-    # 1. Fast Regex Check
-    if settings.enable_regex_filter:
-        regex_hits = scan_prompt_regex(req.prompt)
-        if regex_hits:
-            reasons.extend(regex_hits)
-            risk_score += settings.weight_regex_match * len(regex_hits)
-            
-    # 2. Semantic Check via Llama Guard
-    if settings.enable_llama_guard:
-        is_unsafe, lg_reason = await check_prompt_safety(req.prompt)
-        if is_unsafe:
-            reasons.append(lg_reason)
-            risk_score += settings.weight_llama_guard_unsafe
-
-    # --- RISK SCORING ---
-    blocked = risk_score >= settings.block_threshold
-    
-    if blocked or risk_score > settings.threshold_high_max:
-        risk_level = "BLOCKED" if blocked else "HIGH"
-    elif risk_score > settings.threshold_medium_max:
-        risk_level = "MEDIUM"
-    elif risk_score > settings.threshold_low_max:
-        risk_level = "LOW"
-    else:
-        risk_level = "LOW"
-
-    # --- HANDLE BLOCKED REQUESTS ---
-    if blocked:
-        # Log the blocked attempt
-        log_entry = AuditLog(
-            user_id=req.user_id,
-            endpoint="/v1/chat",
-            prompt=req.prompt,
-            response="",  # No LLM response generated
-            risk_score=risk_score,
-            risk_level=risk_level,
-            blocked=True,
-            detection_reasons=reasons,
-        )
-        db.add(log_entry)
-        db.commit()
+    regex_hits = scan_prompt_regex(req.prompt) if settings.enable_regex_filter else []
+    if regex_hits:
+        reasons.extend(regex_hits)
         
-        # 403 Forbidden is the standard for WAF/Security blocks
-        raise HTTPException(
-            status_code=403, 
-            detail={
-                "blocked": True,
-                "risk_score": risk_score,
-                "risk_level": risk_level,
-                "reasons": reasons
-            }
-        )
+    lg_unsafe, lg_reason = await check_prompt_safety(req.prompt) if settings.enable_llama_guard else (False, "")
+    if lg_unsafe:
+        reasons.append(lg_reason)
+        
+    score, level, blocked = evaluate_risk(len(regex_hits), lg_unsafe, False, False)
+    
+    if blocked:
+        log_entry = AuditLog(user_id=req.user_id, endpoint="/v1/chat", prompt=req.prompt, response="", risk_score=score, risk_level=level, blocked=True, detection_reasons=reasons)
+        db.add(log_entry); db.commit()
+        return ChatResponse(response="Request blocked due to security policies.", risk_score=score, risk_level=level, blocked=True, reasons=reasons)
 
-    # --- ALLOWED REQUESTS: CALL MAIN LLM ---
     try:
-        llm_response = await generate(req.prompt)
+        raw_response = await generate(req.prompt)
     except LLMClientError as e:
-        raise HTTPException(status_code=502, detail=f"LLM backend error: {e}")
+        raise HTTPException(status_code=502, detail=str(e))
+        
+    # Post-flight output scanning (PII check)
+    final_response, pii_labels = scan_and_redact_pii(raw_response) if settings.enable_pii_detection else (raw_response, [])
+    if pii_labels:
+        reasons.extend([f"output_pii_{label.lower()}" for label in pii_labels])
+        score, level, blocked = evaluate_risk(len(regex_hits), lg_unsafe, False, True)
 
-    # Log the successful transaction
-    log_entry = AuditLog(
-        user_id=req.user_id,
-        endpoint="/v1/chat",
-        prompt=req.prompt,
-        response=llm_response,
-        risk_score=risk_score,
-        risk_level=risk_level,
-        blocked=False,
-        detection_reasons=reasons,
-    )
-    db.add(log_entry)
-    db.commit()
+    log_entry = AuditLog(user_id=req.user_id, endpoint="/v1/chat", prompt=req.prompt, response=final_response, risk_score=score, risk_level=level, blocked=False, detection_reasons=reasons)
+    db.add(log_entry); db.commit()
+    
+    return ChatResponse(response=final_response, risk_score=score, risk_level=level, blocked=False, reasons=reasons)
 
-    return ChatResponseAllowed(
-        response=llm_response,
-        risk_score=risk_score,
-        risk_level=risk_level,
-        blocked=False,
-    )
+@router.post("/chat-with-document", response_model=ChatResponse)
+async def chat_with_document(req: DocumentChatRequest, db: Session = Depends(get_db)):
+    reasons = []
+    
+    # Indirect Injection Check: Scan Document Contents using baseline heuristics
+    doc_regex_hits = scan_prompt_regex(req.document_content) if settings.enable_regex_filter else []
+    if doc_regex_hits:
+        reasons.extend([f"indirect_{hit}" for hit in doc_regex_hits])
+        
+    user_prompt_hits = scan_prompt_regex(req.prompt) if settings.enable_regex_filter else []
+    reasons.extend(user_prompt_hits)
+    
+    lg_unsafe, lg_reason = await check_prompt_safety(req.prompt + " " + req.document_content) if settings.enable_llama_guard else (False, "")
+    if lg_unsafe:
+        reasons.append(f"combined_{lg_reason}")
+        
+    score, level, blocked = evaluate_risk(len(user_prompt_hits), lg_unsafe, len(doc_regex_hits) > 0, False)
+    
+    if blocked:
+        log_entry = AuditLog(user_id=req.user_id, endpoint="/v1/chat-with-document", prompt=f"Prompt: {req.prompt} | Doc: {req.document_content[:200]}...", response="", risk_score=score, risk_level=level, blocked=True, detection_reasons=reasons)
+        db.add(log_entry); db.commit()
+        return ChatResponse(response="Request blocked due to indirect security profile risks.", risk_score=score, risk_level=level, blocked=True, reasons=reasons)
+
+    combined_context = f"Document Context:\n{req.document_content}\n\nUser Question: {req.prompt}"
+    try:
+        raw_response = await generate(combined_context)
+    except LLMClientError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+        
+    final_response, pii_labels = scan_and_redact_pii(raw_response) if settings.enable_pii_detection else (raw_response, [])
+    
+    log_entry = AuditLog(user_id=req.user_id, endpoint="/v1/chat-with-document", prompt=req.prompt, response=final_response, risk_score=score, risk_level=level, blocked=False, detection_reasons=reasons)
+    db.add(log_entry); db.commit()
+    
+    return ChatResponse(response=final_response, risk_score=score, risk_level=level, blocked=False, reasons=reasons)
