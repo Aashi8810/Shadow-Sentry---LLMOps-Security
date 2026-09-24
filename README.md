@@ -13,7 +13,7 @@
 [![SQLite](https://img.shields.io/badge/SQLite-Audit%20Log-003B57?style=flat-square&logo=sqlite&logoColor=white)](https://www.sqlite.org/)
 [![SQLAlchemy](https://img.shields.io/badge/SQLAlchemy-ORM-D71F00?style=flat-square&logo=sqlalchemy&logoColor=white)](https://www.sqlalchemy.org/)
 [![Uvicorn](https://img.shields.io/badge/Uvicorn-ASGI-2094f3?style=flat-square&logo=uvicorn&logoColor=white)](https://www.uvicorn.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
+
 
 **An asynchronous, high-performance LLMOps Security Gateway that operates as a defensive reverse proxy in front of Large Language Model orchestration frameworks.**
 
